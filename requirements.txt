@@ -1,0 +1,6 @@
+streamlit
+akshare
+pandas
+tavily-python
+openai
+plotly
