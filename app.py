@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from tavily import TavilyClient
 import openai
 
-# --- 1. 初始化 (必须置顶以防止 KeyError) ---
+# --- 1. 初始化 ---
 if 'history' not in st.session_state:
     st.session_state['history'] = []
 if 'view_report' not in st.session_state:
@@ -17,6 +17,7 @@ def get_beijing_time():
     return datetime.utcnow() + timedelta(hours=8)
 
 
+# 获取当前日期和时间
 CURRENT_DATE = get_beijing_time().strftime("%Y-%m-%d")
 CURRENT_TIME = get_beijing_time().strftime("%H:%M:%S")
 
@@ -27,7 +28,7 @@ try:
     tavily = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
     client = openai.OpenAI(api_key=st.secrets["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
 except:
-    st.error("API Key 未配置")
+    st.error("API Key 未配置，请检查 Streamlit Secrets")
 
 # --- 2. 核心 CSS 样式 ---
 st.markdown(f"""
@@ -43,7 +44,7 @@ st.markdown(f"""
     }}
     .report-card {{
         background: white; padding: 25px; border-radius: 12px; border: 1px solid #E5E7EB;
-        line-height: 1.8; box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+        line-height: 1.8; box-shadow: 0 4px 10px rgba(0,0,0,0.05); color: #1F2937;
     }}
     .metric-card {{
         background: #F9FAFB; padding: 12px; border-radius: 10px; border: 1px solid #F3F4F6; text-align: center;
@@ -65,26 +66,17 @@ def load_code_map():
 
 
 def calculate_technical_indicators(df):
-    """计算支撑压力位及常用指标"""
     high = df['最高'].max()
     low = df['最低'].min()
-    close = df['收盘'].iloc[-1]
-
-    # RSI 计算 (14日)
     delta = df['收盘'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-9)
     rsi = 100 - (100 / (1 + rs)).iloc[-1]
-
-    # 斐波那契支撑压力位 (简单示意)
     diff = high - low
-    support = low + diff * 0.382
-    resistance = low + diff * 0.618
-
     return {
-        "支撑位": round(support, 2),
-        "压力位": round(resistance, 2),
+        "支撑位": round(low + diff * 0.382, 2),
+        "压力位": round(low + diff * 0.618, 2),
         "RSI": round(rsi, 2)
     }
 
@@ -96,12 +88,10 @@ def get_stock_data(code):
         start_day = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_day, adjust="qfq")
         if df.empty: return None, "无数据"
-
         last = df.iloc[-1]
         df['MA5'] = df['收盘'].rolling(5).mean()
         df['MA20'] = df['收盘'].rolling(20).mean()
         tech = calculate_technical_indicators(df)
-
         return {
                    "name": name, "price": last['收盘'], "pct": last['涨跌幅'],
                    "vol": f"{last['成交额'] / 1e8:.2f}亿", "df": df.tail(60), "tech": tech
@@ -116,7 +106,7 @@ st.markdown(f"## 🤖 QuantMind Pro <small style='font-size:14px; color:gray;'>�
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 深度诊股", "⚡ 实时内参", "⚖️ 股票 PK", "🔥 宏观推荐", "📂 历史记录"])
 
-# === Tab 1: 深度诊股 ===
+# === Tab 1: 深度诊股 (保持不变) ===
 with tab1:
     if st.session_state.get('view_report'):
         rec = st.session_state['view_report']
@@ -140,19 +130,17 @@ with tab1:
                 c4.markdown(
                     f'<div class="metric-card"><div class="tech-label">RSI(14)强弱</div><div class="tech-value">{data["tech"]["RSI"]}</div></div>',
                     unsafe_allow_html=True)
-
                 st.line_chart(data['df'].set_index('日期')[['收盘', 'MA5', 'MA20']])
 
                 report_area = st.empty()
                 full_report = ""
                 with st.spinner("AI 正在结合技术面与资讯推演..."):
-                    search_res = tavily.search(query=f"{CURRENT_DATE} {data['name']} 深度研报", max_results=3)
+                    # 搜索优化：限制结果数和搜索深度
+                    search_res = tavily.search(query=f"{CURRENT_DATE} {data['name']} 最新利好利空分析", max_results=3,
+                                               search_depth="basic")
                     ctx = "\n".join([r['content'] for r in search_res['results']])
-                    prompt = f"""
-                    你是首席分析师。股票{data['name']}, 现价{data['price']}, 支撑位{data['tech']['支撑位']}, 压力位{data['tech']['压力位']}, RSI为{data['tech']['RSI']}。
-                    资讯: {ctx}。
-                    请提供：1. 资讯深意；2. 技术面评价(结合支撑/压力位)；3. 止损建议；4. 明确操作逻辑。
-                    """
+                    prompt = f"你是首席分析师。股票{data['name']}, 现价{data['price']}, RSI为{data['tech']['RSI']}。资讯: {ctx}。请简要提供：1. 资讯深意；2. 技术面简评；3. 操盘建议。"
+
                     stream = client.chat.completions.create(model="deepseek-chat",
                                                             messages=[{"role": "user", "content": prompt}], stream=True)
                     for chunk in stream:
@@ -163,42 +151,48 @@ with tab1:
                 st.session_state['history'].insert(0, {"name": data['name'], "code": stock_code, "report": full_report,
                                                        "time": CURRENT_TIME})
 
-# === Tab 2: ⚡ 实时内参 (新功能) ===
+# === Tab 2: ⚡ 实时内参 (极速优化版) ===
 with tab2:
     st.markdown("### ⚡ 实时全网热点与行业趋势")
-    industry_input = st.text_input("输入关注领域(如：低空经济、半导体、茅台)", value="大盘")
+    industry_input = st.text_input("输入关注领域(如：低空经济、AI、半导体)", value="大盘")
     if st.button("🔍 抓取最新情报"):
-        with st.status("正在检索全网最新政策与行业动态...") as s:
-            q = f"2026年1月最新 {industry_input} 行业利好 政策解读 股票推荐"
-            res = tavily.search(query=q, max_results=5)
+        # 第一步：快速检索 (使用 basic 深度提高速度)
+        with st.status("🚀 正在检索最新动态...", expanded=True) as s:
+            q = f"{CURRENT_DATE} {industry_input} 行业利好 政策消息"
+            res = tavily.search(query=q, max_results=3, search_depth="basic")
             ctx = "\n".join([r['content'] for r in res['results']])
+            s.update(label="✅ 资讯检索完成，AI 正在分析中...", state="complete")
 
-            st.markdown("#### 📑 核心资讯快报")
-            st.info(f"检索到关于 {industry_input} 的最新动态，AI 正在为您解读：")
+        # 第二步：流式输出
+        st.markdown("#### 📑 核心资讯深度解析")
+        report_p = st.empty()
+        full_p = ""
 
-            report_p = st.empty()
-            full_p = ""
-            resp = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "user", "content": f"请总结以下资讯中的核心利好、行业趋势，并推荐2-3只相关潜力股且说明理由：\n{ctx}"}],
-                stream=True
-            )
-            for chunk in resp:
-                if chunk.choices[0].delta.content:
-                    full_p += chunk.choices[0].delta.content
-                    report_p.markdown(f'<div class="report-card">{full_p}</div>', unsafe_allow_html=True)
+        # 精简 Prompt 提升 AI 响应速度
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "user", "content": f"基于以下资讯，用 bullet points 总结{industry_input}的3个核心利好逻辑，并点名2只潜力股：\n{ctx}"}],
+            stream=True
+        )
+        for chunk in resp:
+            if chunk.choices[0].delta.content:
+                full_p += chunk.choices[0].delta.content
+                report_p.markdown(f'<div class="report-card">{full_p}</div>', unsafe_allow_html=True)
 
-# === Tab 3: ⚖️ 股票 PK (新功能) ===
+# === Tab 3: ⚖️ 股票 PK (流式增强版) ===
 with tab3:
     st.markdown("### ⚖️ 股票对比分析")
     pc1, pc2 = st.columns(2)
-    code_a = pc1.text_input("股票 A 代码", "600519")
-    code_b = pc2.text_input("股票 B 代码", "000858")
+    code_a = pc1.text_input("股票 A 代码", "600519", key="pk_a")
+    code_b = pc2.text_input("股票 B 代码", "000858", key="pk_b")
+
     if st.button("🆚 开始对比"):
-        da, erra = get_stock_data(code_a)
-        db, errb = get_stock_data(code_b)
+        with st.spinner("获取实时行情数据..."):
+            da, erra = get_stock_data(code_a)
+            db, errb = get_stock_data(code_b)
+
         if not erra and not errb:
-            # 数据对比表
             comparison_df = pd.DataFrame({
                 "指标": ["现价", "涨跌幅", "成交额", "支撑位", "RSI"],
                 da['name']: [da['price'], f"{da['pct']}%", da['vol'], da['tech']['支撑位'], da['tech']['RSI']],
@@ -206,20 +200,27 @@ with tab3:
             })
             st.table(comparison_df)
 
-            # AI 辣评
             st.markdown("#### 🗣️ AI 首席点评")
+            pk_area = st.empty()
+            full_pk = ""
+
+            # 使用流式输出，让对比逻辑一点点跳出来
             resp = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[{"role": "user",
-                           "content": f"对比两只股票：{da['name']}和{db['name']}。前者现价{da['price']}，后者{db['price']}。谁的技术面更好？如果你只能选一只作为中线配置，你会选谁？理由要专业。"}]
+                           "content": f"对比：{da['name']} (RSI:{da['tech']['RSI']}) 与 {db['name']} (RSI:{db['tech']['RSI']})。根据技术面和博弈角度，简短说明哪只更有性价比。"}],
+                stream=True
             )
-            st.write(resp.choices[0].message.content)
+            for chunk in resp:
+                if chunk.choices[0].delta.content:
+                    full_pk += chunk.choices[0].delta.content
+                    pk_area.markdown(f'<div class="report-card">{full_pk}</div>', unsafe_allow_html=True)
+        else:
+            st.error("无法获取对比数据，请检查代码输入是否正确")
 
-# === Tab 4: 宏观推荐 (原有功能优化) ===
+# === Tab 4 & 5 (保持不变) ===
 with tab4:
     st.info("💡 每日 9:30 同步 macro 简报。您也可以通过 '实时内参' 获取即时讯息。")
-
-# === Tab 5: 历史记录 ===
 with tab5:
     for i, item in enumerate(st.session_state.get('history', [])):
         c1, c2 = st.columns([4, 1])
