@@ -8,53 +8,99 @@ import openai
 # --- 1. 全局配置与状态初始化 ---
 st.set_page_config(page_title="QuantMind Pro", page_icon="🔵", layout="wide")
 
-# 初始化 session_state
+# 初始化 Session State
 if 'history' not in st.session_state:
     st.session_state['history'] = []
 if 'view_report' not in st.session_state:
     st.session_state['view_report'] = None
 
-# 初始化 API 客户端
+# 初始化 API (异常处理)
 try:
     tavily = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
     client = openai.OpenAI(api_key=st.secrets["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
 except Exception as e:
-    st.error("⚠️ API Key 配置未找到，请在 secrets.toml 或部署后台中配置 TAVILY_API_KEY 和 DEEPSEEK_API_KEY")
+    st.error(f"⚠️ API Key 配置缺失: {e}")
     st.stop()
 
-# --- 2. 增强型 CSS ---
+# --- 2. 深度专业版 Prompt (拒绝废话) ---
+# 这是你觉得分析得最好的那个版本的逻辑核心
+ANALYSIS_PROMPT = """
+你是一位顶级券商（如中金、中信）的首席策略分析师。请针对股票 {name} ({code})，现价 {price} 元，结合以下资讯进行深度研判。
+
+【分析原则】：
+1. 拒绝空话：不要说“受市场波动影响”等通用废话，必须挖掘具体的供需变化、政策传导路径或企业战略意图。
+2. 逻辑闭环：从“现象”推导“本质”。例如：削减渠道配额 -> 厂家回收利润 -> 增强品牌定价权。
+
+【报告格式】（必须严格遵守）：
+一、核心资讯解读
+   [深度解析资讯背后的战略意图或宏观信号]
+二、基本面与利空利好评估
+   [利好]：...
+   [利空]：...
+三、估值与市场位置分析
+   [结合现价分析PE/PB位置，以及安全边际]
+四、综合结论与操作建议
+   [给出明确评级（买入/增持/观望），并说明中长期逻辑]
+
+【参考资讯】：
+{context}
+"""
+
+# --- 3. 增强型 CSS (找回大气的 UI) ---
 st.markdown("""
     <style>
-    /* 研报卡片 */
-    .report-card { background-color: #ffffff; padding: 25px; border-radius: 15px; border: 1px solid #e2e8f0; line-height: 1.8; color: #1e293b; }
-    /* 章节标题 */
-    .section-title { color: #1e3a8a; border-left: 5px solid #1e3a8a; padding-left: 10px; margin: 20px 0 10px 0; font-weight: bold; }
-    /* 每日推荐卡片 */
-    .recommend-box { background-color: #f8fafc; border-radius: 12px; padding: 15px; border-left: 5px solid #10b981; margin-bottom: 20px; }
-    /* 标签 */
-    .policy-tag { background: #dbeafe; color: #1e40af; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
-    /* 历史记录条目 */
-    .history-item { background: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; border: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: space-between; }
+    /* 全局背景 */
+    .main { background-color: #f8fafc; }
 
-    /* 界面优化 */
-    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
+    /* 研报卡片 - 模拟纸质质感 */
+    .report-card { 
+        background-color: #ffffff; 
+        padding: 30px; 
+        border-radius: 12px; 
+        border: 1px solid #e2e8f0; 
+        box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+        line-height: 1.8; 
+        color: #1e293b; 
+        font-size: 16px;
+    }
+
+    /* 指标卡片 - 顶部蓝条 */
+    .metric-card {
+        background-color: #ffffff; 
+        padding: 20px; 
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04); 
+        border-top: 4px solid #1e3a8a;
+        text-align: center;
+    }
+    .metric-value { color: #1e3a8a; font-size: 24px; font-weight: 800; margin-top: 4px; }
+    .metric-label { color: #64748b; font-size: 14px; }
+
+    /* 输入框与按钮放大 */
+    .stTextInput input { font-size: 18px !important; padding: 12px !important; }
+    div.stButton > button { font-size: 18px !important; padding: 10px 24px !important; font-weight: 600 !important; }
+
+    /* Tabs 标签页放大 */
     .stTabs [data-baseweb="tab"] { font-size: 18px; font-weight: 600; padding: 10px 20px; }
-    .stTextInput input { font-size: 18px; padding: 12px; }
+
+    /* 推荐卡片 */
+    .rec-box { background: white; padding: 20px; border-radius: 12px; border-left: 5px solid #10b981; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
     </style>
     """, unsafe_allow_html=True)
 
 
-# --- 3. 核心功能函数 ---
+# --- 4. 核心数据函数 (带缓存与防错) ---
 @st.cache_data(ttl=3600)
 def get_stock_name(code):
     try:
-        df = ak.stock_info_a_code_name()
-        res = df[df['code'] == code]
-        if not res.empty: return res['name'].values[0]
-        # 兜底
+        # 优先查实时接口，准确率高
         spot = ak.stock_zh_a_spot_em()
-        res_spot = spot[spot['代码'] == code]
-        if not res_spot.empty: return res_spot.iloc[0]['名称']
+        res = spot[spot['代码'] == code]
+        if not res.empty: return res.iloc[0]['名称']
+        # 兜底
+        df = ak.stock_info_a_code_name()
+        res_cache = df[df['code'] == code]
+        if not res_cache.empty: return res_cache['name'].values[0]
         return "未知股票"
     except:
         return "未知股票"
@@ -63,8 +109,13 @@ def get_stock_name(code):
 def get_stock_details(code):
     try:
         name = get_stock_name(code)
+        # 获取 K 线数据
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20251001", adjust="qfq")
-        if df.empty: return None, "未找到该股票数据"
+        if df.empty: return None, "未找到该股票行情数据"
+
+        # 计算均线 (简单计算，无需额外库，手机兼容性好)
+        df['MA5'] = df['收盘'].rolling(5).mean()
+        df['MA10'] = df['收盘'].rolling(10).mean()
 
         last = df.iloc[-1]
         return {
@@ -72,162 +123,179 @@ def get_stock_details(code):
                    "代码": code,
                    "价格": last['收盘'],
                    "涨跌幅": last['涨跌幅'],
-                   "成交额": f"{last['成交额'] / 1e8:.1f}亿",
-                   "历史": df
+                   "成交额": f"{last['成交额'] / 1e8:.2f}亿",
+                   "历史": df  # 返回完整 DF 供绘图用
                }, None
-    except:
-        return None, "数据源繁忙或代码错误"
+    except Exception as e:
+        return None, f"数据源响应异常: {str(e)}"
 
 
-def get_deep_analysis_stream(name, code, price, context):
-    prompt = f"""
-    角色：资深量化策略分析师。
-    任务：分析股票 {name}({code})，现价{price}元。
-    资讯：{context}
-
-    请输出一份专业研报，包含：
-    1. 【核心逻辑】：分析资讯背后的深层战略或供需变化。
-    2. 【利好/利空】：分点评估对基本面的影响。
-    3. 【操作建议】：给出评级（买入/持有/卖出）及理由。
-    """
-    return client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "user", "content": prompt}],
-        stream=True
-    )
-
-
+# --- 5. 功能逻辑区 ---
 @st.cache_data(ttl=1800)
-def get_macro_market_insight():
+def get_market_scan():
+    """获取宏观政策与异动股"""
     try:
-        query = "2026年1月15日 中国股市 宏观政策 行业利好 热点趋势"
-        search = tavily.search(query=query, max_results=5)
-        context = "\n".join([r['content'] for r in search['results']])
+        # 1. 宏观政策搜索
+        q = "2026年1月15日 中国股市 宏观利好 行业政策"
+        search = tavily.search(query=q, max_results=4)
+        ctx = "\n".join([r['content'] for r in search['results']])
 
-        prompt = f"基于以下资讯：{context}，请总结：\n1.今日核心政策解读(100字内)。\n2.三个最具潜力的行业板块及逻辑。"
+        # 2. AI 总结
         resp = client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": f"基于资讯简要总结今日A股核心宏观政策风向(100字内)：\n{ctx}"}]
         )
-        return resp.choices[0].message.content, search
+        policy = resp.choices[0].message.content
+
+        # 3. 异动股抓取
+        spot = ak.stock_zh_a_spot_em()
+        top_3 = spot.sort_values(by='涨跌幅', ascending=False).head(3)
+
+        return policy, top_3
     except:
-        return "暂时无法获取宏观数据", []
+        return "数据获取中...", pd.DataFrame()
 
 
-# --- 4. 页面布局 ---
-st.markdown("<h1 style='color: #1e3a8a;'>🤖 QuantMind Pro 智能投研平台</h1>", unsafe_allow_html=True)
-tab1, tab2, tab3 = st.tabs(["🔍 深度诊股", "🔥 宏观内参", "📂 历史记录"])
+# --- 6. 页面 UI 构建 ---
+st.markdown("<h1 style='color: #1e3a8a; font-weight: 800;'>🤖 QuantMind Pro 智能投研</h1>", unsafe_allow_html=True)
 
-# === Tab 1: 深度诊疗 (核心逻辑) ===
-# === Tab 1: 深度诊疗 ===
+tab1, tab2, tab3 = st.tabs(["🔍 深度诊股", "🔥 每日内参", "📂 历史记录"])
+
+# === Tab 1: 深度诊疗 (你的核心诉求) ===
 with tab1:
+    # 逻辑分支：回看模式 vs 搜索模式
     if st.session_state['view_report']:
+        # [回看模式]
         record = st.session_state['view_report']
-        st.info(f"🕒 您正在查看历史存档：生成于 {record['time']}")
-        if st.button("⬅️ 返回搜索模式"):
+        st.info(f"🕒 历史存档：生成于 {record['time']}")
+
+        if st.button("⬅️ 返回搜索模式", type="secondary"):
             st.session_state['view_report'] = None
             st.rerun()
 
-        st.markdown(f"### {record['name']} ({record['code']}) - 历史研报")
+        st.markdown(f"### {record['name']} ({record['code']})")
+        # 使用 markdown 渲染 HTML 样式的卡片
         st.markdown(f'<div class="report-card">{record["report"]}</div>', unsafe_allow_html=True)
 
     else:
-        c1, c2 = st.columns([1, 2])
+        # [搜索模式]
+        c1, c2 = st.columns([2, 1])
         with c1:
-            stock_code = st.text_input("代码", value="600519", key="search_input", label_visibility="collapsed")
+            stock_code = st.text_input("请输入股票代码", value="600519", label_visibility="collapsed", placeholder="例如 600519")
         with c2:
-            analyze_btn = st.button("🚀 立即分析", use_container_width=False)
+            st.markdown("<div style='height: 4px'></div>", unsafe_allow_html=True)  # 微调对齐
+            analyze_btn = st.button("🚀 立即分析", use_container_width=True, type="primary")
 
         if analyze_btn:
-            res, err = get_stock_details(stock_code)
+            with st.spinner("正在连接交易所数据..."):
+                res, err = get_stock_details(stock_code)
+
             if err:
                 st.error(err)
-            else:  # <--- 确保这里与 if err: 对齐
+            else:
+                # 1. 基本面卡片 (4列布局)
                 st.markdown(f"### {res['名称']} ({stock_code})")
-                cols = st.columns(4)
-                cols[0].metric("最新价", f"¥{res['价格']}")
-                cols[1].metric("涨跌幅", f"{res['涨跌幅']}%")
-                cols[2].metric("成交额", res['成交额'])
-                cols[3].metric("时间", datetime.now().strftime("%H:%M"))
+                m1, m2, m3, m4 = st.columns(4)
+                metrics = [
+                    ("最新价", f"¥{res['价格']}"),
+                    ("涨跌幅", f"{res['涨跌幅']}%"),
+                    ("成交额", res['成交额']),
+                    ("时间", datetime.now().strftime("%H:%M"))
+                ]
+                for i, (label, val) in enumerate(metrics):
+                    with [m1, m2, m3, m4][i]:
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <div class="metric-label">{label}</div>
+                            <div class="metric-value">{val}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
-                with st.expander("📈 价格走势图", expanded=True):
-                    df_plot = res['历史'].tail(60).set_index('日期')
-                    st.line_chart(df_plot[['收盘']])
+                # 2. 走势图 (防报错优化版)
+                st.markdown("#### 📈 价格走势 (MA5/MA10)")
+                with st.expander("点击展开/折叠图表", expanded=True):
+                    # 仅选取必要的数值列进行绘图，避免复杂对象导致手机端 structuredClone 报错
+                    chart_data = res['历史'].set_index('日期')[['收盘', 'MA5', 'MA10']]
+                    st.line_chart(chart_data, color=["#1e3a8a", "#f59e0b", "#10b981"])
 
+                # 3. AI 深度研报 (核心)
                 st.divider()
-                st.markdown("#### 📝 AI 深度研报 (实时生成)")
-                report_placeholder = st.empty()
+                st.markdown("#### 📝 AI 深度投资研究报告")
+                report_area = st.empty()
                 full_report = ""
 
-                with st.status("AI 正在联网分析中...", expanded=True) as status:
-                    search_res = tavily.search(query=f"2026年1月15日 {res['名称']} 深度分析", max_results=3)
-                    ctx = "\n".join([r['content'] for r in search_res['results']])
+                with st.status("AI 正在全网检索深度资讯...", expanded=True) as status:
+                    # 搜索
+                    try:
+                        q = f"2026年1月15日 {res['名称']} 深度研报 行业基本面"
+                        search = tavily.search(query=q, max_results=4)
+                        context = "\n".join([r['content'] for r in search['results']])
 
-                    stream = get_deep_analysis_stream(res['名称'], stock_code, res['价格'], ctx)
-                    for chunk in stream:
-                        if chunk.choices[0].delta.content:
-                            content = chunk.choices[0].delta.content
-                            full_report += content
-                            report_placeholder.markdown(f'<div class="report-card">{full_report}</div>',
-                                                        unsafe_allow_html=True)
+                        # 生成
+                        stream = client.chat.completions.create(
+                            model="deepseek-chat",
+                            messages=[{"role": "user", "content": ANALYSIS_PROMPT.format(
+                                name=res['名称'], code=stock_code, price=res['价格'], context=context
+                            )}],
+                            stream=True
+                        )
 
-                    # 存入历史
-                    st.session_state['history'].insert(0, {
-                        'code': stock_code,
-                        'name': res['名称'],
-                        'time': datetime.now().strftime("%m-%d %H:%M"),
-                        'report': full_report
-                    })
-                    status.update(label="✅ 分析完成", state="complete")
+                        for chunk in stream:
+                            if chunk.choices[0].delta.content:
+                                txt = chunk.choices[0].delta.content
+                                full_report += txt
+                                report_area.markdown(f'<div class="report-card">{full_report}</div>',
+                                                     unsafe_allow_html=True)
 
-# === Tab 2: 每日推荐 ===
+                        # 自动归档
+                        new_record = {
+                            'code': stock_code, 'name': res['名称'],
+                            'time': datetime.now().strftime("%m-%d %H:%M"),
+                            'report': full_report
+                        }
+                        st.session_state['history'].insert(0, new_record)
+                        status.update(label="✅ 深度研报生成完毕", state="complete")
+
+                    except Exception as e:
+                        st.error(f"AI 生成中断: {e}")
+
+# === Tab 2: 每日内参 ===
 with tab2:
-    if st.button("🔄 获取今日市场宏观内参", type="primary"):
-        with st.spinner("正在扫描全市场..."):
-            insight, _ = get_macro_market_insight()
+    st.subheader("📢 市场宏观与机会")
+    if st.button("🔄 刷新今日数据"):
+        with st.spinner("AI 正在扫描全市场..."):
+            policy, top_stocks = get_market_scan()
 
-            c_left, c_right = st.columns([3, 2])
-            with c_left:
-                st.markdown("#### 📜 宏观与行业洞察")
-                st.info(insight)
+            # 政策部分
+            st.info(f"📜 **今日宏观风向**：\n{policy}")
 
-            with c_right:
-                st.markdown("#### 🚀 今日异动热榜")
-                top_df = ak.stock_zh_a_spot_em().sort_values(by='涨跌幅', ascending=False).head(3)
-                for _, row in top_df.iterrows():
+            # 异动个股
+            st.markdown("#### 🚀 异动榜前三")
+            cols = st.columns(3)
+            for i, (idx, row) in enumerate(top_stocks.iterrows()):
+                with cols[i]:
                     st.markdown(f"""
-                    <div class="recommend-box">
-                        <div style="font-weight:bold; color:#1e3a8a">{row['名称']} ({row['代码']})</div>
-                        <div style="display:flex; justify-content:space-between; margin-top:5px">
-                            <span>现价: ¥{row['最新价']}</span>
-                            <span style="color:#ef4444; font-weight:bold">+{row['涨跌幅']}%</span>
-                        </div>
+                    <div class="rec-box">
+                        <h3 style="margin:0;color:#1e3a8a">{row['名称']}</h3>
+                        <p style="color:#666">{row['代码']}</p>
+                        <div style="font-size:20px;color:#ef4444;font-weight:bold">+{row['涨跌幅']}%</div>
+                        <p>现价: {row['最新价']}</p>
                     </div>
                     """, unsafe_allow_html=True)
 
-# === Tab 3: 历史记录 (修复版) ===
+# === Tab 3: 历史记录 ===
 with tab3:
-    st.markdown("### 📂 您的投研足迹")
+    st.subheader("📂 您的投研足迹")
     if not st.session_state['history']:
-        st.write("暂无记录，请去【深度诊股】进行分析。")
+        st.write("暂无记录，快去 Tab 1 体验深度分析吧！")
     else:
         for i, item in enumerate(st.session_state['history']):
-            # 使用 container 布局每一行
             with st.container():
-                col1, col2, col3 = st.columns([2, 2, 1])
-                col1.markdown(f"**{item['name']}**")
-                col2.caption(f"生成时间: {item['time']}")
-                # 关键：这里点击后更新 session_state 并 rerun
-                if col3.button("📄 回看", key=f"hist_btn_{i}"):
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.markdown(f"**{item['name']}** ({item['code']})")
+                c2.caption(item['time'])
+                # 点击回看，触发 Rerun 跳转回 Tab 1
+                if c3.button("📄 回看", key=f"h_{i}"):
                     st.session_state['view_report'] = item
-                    st.rerun()  # 强制刷新，Tab 1 会捕捉到 view_report 状态
+                    st.rerun()
             st.divider()
-
-# 侧边栏
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/10473/10473523.png", width=50)
-    st.title("QuantMind Pro")
-    st.info("版本: v1.0.0 (生产环境版)")
-    if st.button("清除所有历史"):
-        st.session_state['history'] = []
-        st.rerun()
